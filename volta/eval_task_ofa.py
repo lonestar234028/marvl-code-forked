@@ -7,6 +7,8 @@
 import os
 import sys
 import json
+import time
+
 import yaml
 import random
 import logging
@@ -20,12 +22,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from transformers import OFATokenizer, OFAModel
 
 from volta.config import BertConfig
 from volta.encoders import BertForVLTasks
 from volta.train_utils import tbLogger
 from volta.task_utils import LoadDatasetEval, LoadLoss, EvaluatingModel
-
+from volta.datasets.from_dataset import get_dataset
+tnz = OFATokenizer.from_pretrained("OFA-Sys/OFA-base")
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
@@ -77,7 +81,7 @@ def parse_args():
     # Distributed
     parser.add_argument("--local_rank", type=int, default=-1,
                         help="local_rank for distributed training on gpus")
-    parser.add_argument("--num_workers", type=int, default=0,
+    parser.add_argument("--num_workers", type=int, default=16,
                         help="Number of workers in the dataloader.")
     parser.add_argument("--in_memory", default=False, type=bool,
                         help="whether use chunck for parallel training.")
@@ -108,19 +112,6 @@ def main():
         default_gpu = True
     logger.info(f"device: {device} n_gpu: {n_gpu}, distributed training: {bool(args.local_rank != -1)}")
 
-    # Load config
-    config = BertConfig.from_json_file(args.config_file)
-
-    # Load task config
-    with open(args.tasks_config_file, "r") as f:
-        task_cfg = edict(yaml.safe_load(f))
-    task_id = args.task.strip()
-    task = "TASK" + task_id
-    task_name = task_cfg[task]["name"]
-    if task_cfg[task].get("fusion_method", None):
-        # VL-BERT pooling for VQA
-        config.fusion_method = task_cfg[task]["fusion_method"]
-
     # Output dirs
     timeStamp = args.from_pretrained.split("/")[-1] + "-" + args.save_name
     savePath = os.path.join(args.output_dir, timeStamp)
@@ -131,71 +122,85 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
+    save_path = "D:\\marvl-images\\zh\\images\\ofa_zh_test/"
 
-    # Dataset
-    batch_size, task2num_iters, dset_val, dl_val = LoadDatasetEval(args, config, task_cfg, args.task)
+    from datasets import load_from_disk
+    def get_dataset_v1():
+        s = load_from_disk(save_path)
+        return s
+    ds = get_dataset_v1()
+    y = 0
+    n = 0
+    # for i in ds:
+    #     if i["labels"][0] == 1:
+    #         y += 1
+    #     else:
+    #         n += 1
+    # print("get_dataset: {}, positives:{}, negatives:{}.".format((len(ds)), y, n))
 
-    # Logging
-    tb_logger = tbLogger(timeStamp, savePath, [task_name], [task], task2num_iters,
-                         1, save_logger=False, txt_name="eval.txt")
+    # Eval
+    res_list = []
+    model = OFAModel.from_pretrained("OFA-Sys/OFA-base", use_cache=False)
+    # model.to(device)
 
-    # Model
-    if "roberta" in args.bert_model:
-        config.model = "roberta"
-    model = BertForVLTasks.from_pretrained(args.from_pretrained, config=config, task_cfg=task_cfg, task_ids=[task])
+    json_path = os.path.join(savePath, args.split, str(time.time()))
+    with torch.no_grad():
+        with open(json_path + "_result.json", "w") as f:
+            for i in tqdm(range(len(ds))):
+                picture = torch.tensor(ds[i]["picture"])
+                tokens = torch.tensor([ds[i]["tokens"]])
+                c = model.generate(tokens, patch_images=picture, num_beams=4)
+                res = tnz.batch_decode(c, skip_special_tokens=True)
+                d = ds[i]["labels"][0]
+                f.write(str((res[0].strip(), d)) + "\n")
+                res_list.append((res[0].strip(), d))
+        json.dump(res_list, open(json_path + "_result1.json", "w"))
 
-    # Optimization details
-    criterion = LoadLoss(task_cfg, args.task)
+    # Metrics
+    ans = []
+    pred_pos = 0
+    pred_false = 0
+    for i in res_list:
+        if i[0] == "yes":
+            pred_pos += 1
+            ans.append(i[1] == 1)
+        else:
+            pred_false += 1
+            ans.append(i[1] == "False")
+    print("total:{}, pred_pos:{},true_pos:{}, pred_false:{}, true_false:{}, acc:{}".format(len(ans), pred_pos, y,
+                                                                                           pred_false, n,
+                                                                                           sum(ans) / len(ans)))
 
-    # Move to GPU(s)
-    model.to(device)
-    if args.local_rank != -1:
-        try:
-            from apex.parallel import DistributedDataParallel as DDP
-        except ImportError:
-            raise ImportError(
-                "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training."
-            )
-        model = DDP(model, delay_allreduce=True)
-    elif n_gpu > 1:
-        model = nn.DataParallel(model)
+    # results = []
+    # others = []
+    # for i, batch in tqdm(enumerate(dl_val), total=task2num_iters[task]):
+    #     loss, score, batch_size, results, others = EvaluatingModel(config, task_cfg, device, task, batch,
+    #                                                                model, dl_val, criterion, results, others)
 
-    # Print summary
-    if default_gpu:
-        print("***** Running evaluation *****")
-        print("  Num Iters: ", task2num_iters[task])
-        print("  Batch size: ", batch_size)
+    #     tb_logger.step_val(0, float(loss), float(score), task, batch_size, "val")
+    #     sys.stdout.write("%d/%d\r" % (i, len(dl_val)))
+    #     sys.stdout.flush()
+    # # save the result or evaluate the result.
+    # ave_score = tb_logger.showLossVal(task)
+    # if task == "TASK12":
+    #     from collections import defaultdict
+    #     sent2corrects = defaultdict(list)
+    #     for e in results:
+    #         s = e["sentence"]
+    #         # s1 = s[s.index('Question'):]
+    #         sent2corrects[s].append(e["prediction"] == e["label"])
+    #     s = 0
+    #     for l in sent2corrects.values():
+    #         s += (sum(l) == len(l))
+    #     consistency = float(s) / len(sent2corrects) * 100
+    #     logger.info(f"Consistency: {consistency}")
 
-    # Evaluate
-    model.eval()
-    results = []
-    others = []
-    for i, batch in tqdm(enumerate(dl_val), total=task2num_iters[task]):
-        loss, score, batch_size, results, others = EvaluatingModel(config, task_cfg, device, task, batch,
-                                                                   model, dl_val, criterion, results, others)
-
-        tb_logger.step_val(0, float(loss), float(score), task, batch_size, "val")
-        sys.stdout.write("%d/%d\r" % (i, len(dl_val)))
-        sys.stdout.flush()
-    # save the result or evaluate the result.
-    ave_score = tb_logger.showLossVal(task)
-    if task == "TASK12":
-        from collections import defaultdict
-        sent2corrects = defaultdict(list)
-        for e in results:
-            sent2corrects[e["sentence"]].append(e["prediction"] == e["label"])
-        s = 0
-        for l in sent2corrects.values():
-            s += (sum(l) == len(l))
-        consistency = float(s) / len(sent2corrects) * 100
-        logger.info(f"Consistency: {consistency}")
-
-    if args.split:
-        json_path = os.path.join(savePath, args.split)
-    else:
-        json_path = os.path.join(savePath, task_cfg[task]["val_split"])
-    json.dump(results, open(json_path + "_result.json", "w"))
-    json.dump(others, open(json_path + "_others.json", "w"))
+    # if args.split:
+    #     json_path = os.path.join(savePath, args.split)
+    # else:
+    #     json_path = os.path.join(savePath, task_cfg[task]["val_split"])
+    # json.dump(results, open(json_path + "_result.json", "w"))
+    # json.dump(others, open(json_path + "_others.json", "w"))
 
 
 if __name__ == "__main__":

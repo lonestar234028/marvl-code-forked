@@ -439,7 +439,7 @@ def LoadDatasetEval(args, config, task_cfg, task_id):
         dset_val,
         shuffle=False,
         batch_size=batch_size,
-        num_workers=10,
+        num_workers=0,
         pin_memory=True,
         drop_last=args.drop_last,
     )
